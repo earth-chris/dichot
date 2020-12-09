@@ -1,0 +1,256 @@
+#! /usr/bin/env python
+"""Applies a ccbid model to new data
+"""
+
+import sys
+import numpy as np
+import pandas as pd
+import ccbid
+from ccbid import args
+from ccbid import prnt
+
+
+# set up the argument parser to read command line inputs
+def parse_args():
+    """Function to read CCB-ID command line arguments
+
+    Args:
+        None - reads from sys.argv
+
+    Returns:
+        an argparse object
+    """
+
+    # create the argument parser
+    parser = args.create_parser(
+        description="Apply a CCB-ID species classification model to csv or image data."
+    )
+
+    # set up the arguments for dealing with file i/o
+    args.input(parser)
+    args.mask(parser)
+    args.output(parser)
+    args.ecodse(parser)
+    args.models(
+        parser, help="path to the ccbid model to apply", default=None, required=True
+    )
+
+    # arguments to turn on certian flags or set specific parameters
+    args.remove_outliers(parser)
+    args.aggregate(parser)
+    args.labels(parser)
+    args.uncalibrated(parser)
+    args.cpus(
+        parser
+    )  # maybe add function to model object to update the n_cpus in each model
+    args.verbose(parser)
+
+    # parse the inputs from sys.argv
+    return parser.parse_args(sys.argv[1:])
+
+
+# set up the logic to parse command line arguments and ensure consistent logic
+def arg_logic(argv):
+    """Parses the command line arguments to ensure consistency prior to running the main script
+
+    Args:
+        args - the arguments returned from the argparse object
+
+    Returns:
+        None. This function updates the args object
+    """
+
+    # if the ECODSE flag is set, override whatever is set at the command line
+    if args.ecodse:
+        argv.input = args.path_testing
+        argv.remove_outliers = "PCA"
+        argv.threshold = 4
+        argv.aggregate = "average"
+        argv.uncalibrated = False
+        # args.feature_selection = False
+
+
+# set up the main script function
+def main():
+    """The main function for ccbid apply
+
+    Args:
+        None - just let it fly
+
+    Returns:
+        None - this runs the dang script
+    """
+
+    # first read the command line arguments
+    argv = parse_args()
+
+    # parse the logic to make sure everything runs smoothly
+    arg_logic(argv)
+
+    # set the seed for reproducibility (to the year the CCB was founded)
+    np.random.seed(1984)
+
+    # -----
+    # step 1. reading data
+    # -----
+
+    if argv.verbose:
+        prnt.line_break()
+        prnt.status("Reading input data")
+
+    # first read the model data
+    model = ccbid.read.pck(argv.model[0])
+
+    # get base data from the model
+    sp_labels = model.labels_
+
+    # set up a dummy variable to determine if data should be output on a per-crown or per-=pixel basis
+
+    # then read the feature data, which may come as a raster or a csv
+    if ccbid.read.is_csv(argv.input):
+        id_labels, features = ccbid.read.training_data(argv.input)
+
+    elif ccbid.read.is_raster(args.input):
+        raster = ccbid.read.raster(argv.input)
+        raster.read_all()
+
+        # if a mask is set, just apply the model to those data
+        if argv.mask is not None:
+            mask = ccbid.read.raster(argv.mask)
+            mask_ind = mask.read_band(1).data == 1
+            features = raster.data[mask_ind]
+            mask.data = None
+
+        # if no mask is set, just use the straight image data
+        else:
+            # first, check for no-data values
+            if raster.no_data is not None:
+                features = raster.data[raster.data != raster.no_data]
+
+            # otherwise, flatten the data from [x, y, features] to [rows, features]
+            else:
+                features = raster.data.reshape((raster.nx * raster.ny, raster.nb))
+
+        # and clear memory
+        raster.data = None
+        # work on this later
+
+    else:
+        prnt.error("Unsupported file format. Must be a csv or a raster file.")
+        sys.exit(1)
+
+    # subset the features by band if the model contains a good bands attribute
+    if model.good_bands_ is not None:
+        features = features[:, model.good_bands_]
+
+    # -----
+    # step 2. outlier removal
+    # -----
+
+    if argv.remove_outliers:
+        if argv.verbose:
+            prnt.status("Removing outliers using {}".format(argv.remove_outliers))
+
+        # currently only one version of outlier removal
+        if argv.remove_outliers == "PCA":
+            mask = ccbid.outliers.with_pca(features, thresh=argv.threshold)
+
+        # subset all data using the mask for future analyses
+        features = features[mask, :]
+        id_labels = id_labels[mask]
+
+        # report on the number of samples removed
+        if argv.verbose:
+            n_removed = mask.shape[0] - mask.sum()
+            prnt.status("Removed {} samples".format(n_removed))
+
+    # -----
+    # step 3: data transformation
+    # -----
+
+    if model.reducer is not None:
+        if argv.verbose:
+            prnt.status("Transforming feature data")
+
+        features = model.reducer.transform(features)
+
+        # then supbset the transformed features
+        if model.n_features_ is not None:
+            features = features[:, 0 : model.n_features_]
+
+    # -----
+    # step 4: applying the model
+    # -----
+
+    if argv.verbose:
+        prnt.line_break()
+        prnt.status("Applying CCBID model to input features")
+
+    # determine whether to use the calibrated prediction probabilities
+    use_calibrated = True
+    if argv.uncalibrated:
+        use_calibrated = False
+    else:
+        if not model.is_calibrated_:
+            use_calibrated = False
+
+    print(use_calibrated)
+
+    # pred = model.predict(features)
+    prob = model.predict_proba(
+        features, use_calibrated=use_calibrated, average_proba=True
+    )
+
+    # ensemble the pixels to the crown scale
+    if argv.aggregate is not None:
+
+        # do it differently for csv vs raster
+        if ccbid.read.is_csv(argv.input):
+
+            # calculate the crown ensemble
+            if argv.aggregate == "average":
+                output_pr = ccbid.crown_ensemble.average(prob, id_labels, sp_labels)
+
+            # create the crown id labels (also, create the model.labels property)
+            id_rows, sp_rows = ccbid.crown_ensemble.get_csv_labels(
+                id_labels, sp_labels
+            )
+
+            # add everything to a pandas dataframe and save the result
+            df = pd.DataFrame.from_items(
+                (("crown", id_rows), ("species", sp_rows), ("probability", output_pr))
+            )
+            df.to_csv(argv.output, index=False)
+
+        elif ccbid.read.is_raster(argv.input):
+            # get the crown IDs from a separate raster
+            try:
+                ccbid.read.raster(argv.labels)
+            except RuntimeError:
+                prnt.error("Unable to read label file: {}".format(argv.labels))
+                prnt.error(
+                    "Check the file path or run without --aggregate to obtain pixel-scale predictions"
+                )
+
+    # or, output the raw predictions if not aggregating
+    else:
+        # do it differently for csv vs raster
+        if ccbid.read.is_csv(argv.input):
+            # write out results as a pandas dataframe
+            df_id = pd.DataFrame.from_items(("id", id_labels))
+            df_pr = pd.DataFrame(prob, columns=sp_labels)
+            df = df_id.append(df_pr)
+            df.to_csv(argv.output, index=False)
+
+    prnt.line_break()
+    prnt.status("CCB-ID model application complete!")
+    prnt.status("Please see the final output file:")
+    prnt.status("  {}".format(argv.output))
+    prnt.line_break()
+
+    # phew
+
+
+# just run the dang script, will ya?
+if __name__ == "__main__":
+    main()
